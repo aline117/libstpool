@@ -530,7 +530,12 @@ OSPX_pthread_cond_init(OSPX_pthread_cond_t *cond)
 	int e;
 
 	pthread_condattr_t *attr = NULL;
-#if defined(HAS_CLOCK_GETTIME) && defined(HAS_CLOCK_MONOTONIC) && defined(HAS_PTHREAD_CONDATTR_SETCLOCK)
+/*
+ * PATCH(macOS): Darwin never provides @pthread_condattr_setclock, so we must
+ * never rely on it there (the symbol does not even exist).
+ */
+#if defined(HAS_CLOCK_GETTIME) && defined(HAS_CLOCK_MONOTONIC) && \
+	defined(HAS_PTHREAD_CONDATTR_SETCLOCK) && !defined(__APPLE__)
 	/* We use the mononic clock if the OS supports it */
 	{
 		pthread_condattr_t attr0;
@@ -553,6 +558,33 @@ EXPORT int
 OSPX_pthread_cond_timedwait(OSPX_pthread_cond_t *cond, OSPX_pthread_mutex_t *mut, long to) 
 {
 	int error = 0;
+
+#if defined(__APPLE__) && !defined(_WIN)
+	/**
+	 * PATCH(macOS):
+	 *
+	 * Darwin does not provide @pthread_condattr_setclock, so every cond var is
+	 * permanently bound to CLOCK_REALTIME. The generic POSIX implementation
+	 * below builds the absolute deadline with @clock_gettime(CLOCK_MONOTONIC)
+	 * (seconds since boot), which compared against CLOCK_REALTIME (seconds 
+	 * since epoch) is always far in the past. As a result every timed wait
+	 * returned ETIMEDOUT immediately and the task pool degenerated into a
+	 * busy polling loop.
+	 *
+	 * @pthread_cond_timedwait_relative_np is an Apple-specific API which takes
+	 * a RELATIVE and MONOTONIC timeout, the clock attribute of the cond var is
+	 * simply not involved, so the mismatch cannot happen any more.
+	 */
+	if (0 > to)
+		return pthread_cond_wait(cond, mut);
+	{
+		struct timespec rel;
+
+		rel.tv_sec  =  to / 1000;
+		rel.tv_nsec = (to % 1000) * 1000000L;
+		return pthread_cond_timedwait_relative_np(cond, mut, &rel);
+	}
+#endif
 
 #ifdef _WIN
 	int generation_at_start;
@@ -613,11 +645,23 @@ OSPX_pthread_cond_timedwait(OSPX_pthread_cond_t *cond, OSPX_pthread_mutex_t *mut
 #else
 	struct timespec abstime = {0};
 	
+	/**
+	 * PATCH: the 'infinite wait' case must RETURN here. The original code fell
+	 * through into the timed wait below, which turned '-1' into a deadline in
+	 * the past, so every infinite wait returned ETIMEDOUT as soon as it was
+	 * signalled (broke @stpool_wait_all(pool, -1), @stpool_task_wait(...) etc).
+	 */
 	if (0 > to)
-		error = pthread_cond_wait(cond, mut);
+		return pthread_cond_wait(cond, mut);
 
 #ifdef HAS_CLOCK_GETTIME
-#ifdef HAS_CLOCK_MONOTONIC
+	/**
+	 * PATCH: the deadline MUST be expressed in the clock that the cond var was
+	 * initialized with (see @OSPX_pthread_cond_init). Only when the cond var
+	 * really uses CLOCK_MONOTONIC may we compute the deadline with it, 
+	 * otherwise every timed wait expires instantly.
+	 */
+#if defined(HAS_CLOCK_MONOTONIC) && defined(HAS_PTHREAD_CONDATTR_SETCLOCK)
 	clock_gettime(CLOCK_MONOTONIC, &abstime);
 #else	
 	clock_gettime(CLOCK_REALTIME, &abstime);

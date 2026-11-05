@@ -572,6 +572,9 @@ out:
 	return self->last_to;
 }
 
+/* defined below; an exiting thread uses it to flush the deferred threads */
+void do_create_threads(thread_t *self);
+
 int
 cpool_core_thread_entry(void *arg) 
 {
@@ -599,6 +602,32 @@ cpool_core_thread_entry(void *arg)
 		
 	} while (THREAD_STAT_LEAVE != (self->status & ~THREAD_STAT_INNER));
 		
+	/**
+	 * PATCH: The thread objects queued in @self->thq have already been accounted
+	 * by @cpool_core_add_threadsl (it has increased n_qths, nthreads_real_free,
+	 * nthreads_real_pool and the core's reference), they are only really created
+	 * behind our next successful @gettask (see @cpool_core_schedule).
+	 *
+	 * If we exit now, @INIT_thread_structure below would silently drop them, and
+	 * the pool would believe forever that it still has free servering threads:
+	 * @cpool_core_need_ensure_servicesl() returns false for good from then on, so
+	 * no worker is ever created or woken up again and every pending task
+	 * (including the routines used by the named threads) is stranded forever.
+	 */
+	if (!list_empty(&self->thq)) {
+		thread_t *thread;
+		int nq = 0;
+
+		list_for_each_entry(thread, &self->thq, thread_t, link_free)
+			++ nq;
+
+		MSG_log(M_THREAD, LOG_WARN,
+			"{\"%s\"/%p} thread(%d) exits with %d deferred thread(s), creating them now.\n",
+			core->desc, core, self, nq);
+
+		do_create_threads(self);
+	}
+
 	INIT_thread_structure(core, self);
 	smcache_add_limit(&core->cache_thread, self, -1);
 	
@@ -702,7 +731,14 @@ do_create_threads(thread_t *self)
 	 */ 
 	if (!list_empty(&exq)) { 
 		do {
-			thread_t *thread = list_entry(self->thq.next, 
+			/**
+			 * PATCH: we are draining @exq here, but the original code popped
+			 * the node from @self->thq (which is empty at this point since all
+			 * of them have been moved into @exq), so it handed a garbage 
+			 * pointer to @smcache_add and corrupted the heap whenever 
+			 * @OSPX_pthread_create failed.
+			 */
+			thread_t *thread = list_entry(exq.next, 
 					thread_t, link_free);
 		
 			list_del(&thread->link_free);	

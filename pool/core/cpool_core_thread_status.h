@@ -87,7 +87,14 @@ cpool_core_thread_status_changel(cpool_core_t *core, thread_t *self, long status
 			-- core->n_qths_wait;
 		} 
 		if (!((THREAD_STAT_RM|THREAD_STAT_GC) & self->flags)) {
+			/**
+			 * PATCH: never mark ourself died while we still own deferred threads
+			 * (@self->thq). They have already been accounted by 
+			 * @cpool_core_add_threadsl, if we exit they are dropped silently and 
+			 * the pool will never create/wake up any servering thread again.
+			 */
 			if ((core->nthreads_real_pool > core->minthreads) && !core->n_qdispatchs &&
+				list_empty(&self->thq) &&
 				((!core->npendings) || core->paused)) { 
 				unsigned n = (unsigned)time(NULL);
                 /**
