@@ -73,6 +73,16 @@ endif()
 # for code completion frameworks
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The probes below link against libpthread (and librt, where clock_gettime()
+# and sem_timedwait() still live for glibc < 2.17). Tell the check_* commands
+# about it before the first probe, or they report false negatives.
+if(NOT WIN32)
+  set(CMAKE_REQUIRED_LIBRARIES pthread)
+  if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    list(APPEND CMAKE_REQUIRED_LIBRARIES rt)
+  endif()
+endif()
+
 # Check if header files exist
 list(APPEND FILES_TO_CHECK
     stdint.h
@@ -109,6 +119,7 @@ else()
   list(APPEND SYMBOLS_TO_CHECK
     prctl
     sem_timedwait
+    pthread_condattr_setclock   # HAS_PTHREAD_CONDATTR_SETCLOCK (absent on Darwin)
     )
     if (APPLE)
       list(APPEND SYMBOLS_TO_CHECK mach_absolute_time)
@@ -119,17 +130,114 @@ endif()
 CHECK_SYMBOLS_EXIST("${SYMBOLS_TO_CHECK}" "${EVENT_INCLUDES}" "")
 unset(SYMBOLS_TO_CHECK)
 
-# Only `CHECK_TYPE_SIZE()' will use `CMAKE_EXTRA_INCLUDE_FILES'
-set(CMAKE_EXTRA_INCLUDE_FILES ${EVENT_INCLUDES})
-CHECK_TYPE_SIZE("CLOCK_MONOTONIC"  HAS_CLOCK_MONOTONIC)
-CHECK_TYPE_SIZE("pthread_rwlock_t" HAS_PTHREAD_RWLOCK)
-CHECK_TYPE_SIZE("sem_timedwait"    HAS_SEM_TIMEDWAIT)
-CHECK_TYPE_SIZE("pthread_condattr_setclock" HAS_PTHREAD_CONDATTR_SETCLOCK)
+# Every switch that .help/.ospx_config.h.cmake asks for must be probed here,
+# otherwise its #cmakedefine silently ends up "undef" on every platform:
+#
+#   HAS_STDINT_H                     <- CHECK_INCLUDE_FILE_CONCAT(stdint.h)
+#   HAS_PTHREAD_RWLOCK               <- check_c_source_compiles(pthread_rwlock_t)
+#   HAS_CLOCK_MONOTONIC              <- check_c_source_compiles(CLOCK_MONOTONIC)
+#   HAS_CLOCK_GETTIME                <- CHECK_SYMBOLS_EXIST(clock_gettime)
+#   HAS_PTHREAD_CONDATTR_SETCLOCK    <- CHECK_SYMBOLS_EXIST(pthread_condattr_setclock)
+#   HAS_PTHREAD_ATTR_GETINHERITSCHED <- CHECK_SYMBOLS_EXIST(pthread_attr_getinheritsched)
+#   HAS_SEM_TIMEDWAIT                <- CHECK_SYMBOLS_EXIST(sem_timedwait)
+#   HAS_PRCTL                        <- CHECK_SYMBOLS_EXIST(prctl)
+#
+# NOTE: the four CHECK_TYPE_SIZE() calls that used to live here always failed
+# ("Check size of ... - failed", all four variables end up empty, verified with
+# cmake 3.27 + gcc):
+#   - sem_timedwait / pthread_condattr_setclock are functions, not types;
+#   - CLOCK_MONOTONIC / pthread_rwlock_t were probed without any #include
+#     (CMAKE_EXTRA_INCLUDE_FILES was empty), so the identifiers were unknown.
+# As a result HAS_SEM_TIMEDWAIT, HAS_PTHREAD_CONDATTR_SETCLOCK and
+# HAS_PTHREAD_RWLOCK were never defined at all.
+#
+# HAS_CLOCK_GETTIME / HAS_SEM_TIMEDWAIT / HAS_PTHREAD_CONDATTR_SETCLOCK are
+# already resolved by CHECK_SYMBOLS_EXIST() above, so only the two type/constant
+# style probes are repeated here -- with the includes the autoconf script uses.
+if(NOT WIN32)
+  check_c_source_compiles("
+#include <pthread.h>
+int main(void) { pthread_rwlock_t lock; return (int)sizeof(lock); }
+" HAS_PTHREAD_RWLOCK)
+
+  # mirrors `configure`: clock_gettime(CLOCK_MONOTONIC, &ts) must compile+link
+  check_c_source_compiles("
+#include <time.h>
+int main(void) { struct timespec ts; return (int)clock_gettime(CLOCK_MONOTONIC, &ts); }
+" HAS_CLOCK_MONOTONIC)
+endif()
+
+# ---------------------------------------------------------------------------
+# Turn the probe results into compile line switches.
+#
+# NOTE: we deliberately do NOT generate os/ospx_config.h here. ospx_type.h does
+# `#include "ospx_config.h"`, which always resolves to the copy sitting next to
+# it, so a generated file in the build tree would never be seen. The copy under
+# os/ stays untouched as the fallback of the `./configure` + Makefile build and
+# both have to stay in sync (the -D list below is exactly what it #defines).
+# ---------------------------------------------------------------------------
+if(APPLE)
+  # ---- Darwin policy, do not relax ---------------------------------------
+  # Darwin does not provide pthread_condattr_setclock(): its cond vars are
+  # permanently bound to CLOCK_REALTIME and ospx.c uses the Apple specific
+  # pthread_cond_timedwait_relative_np() instead. If either of these were
+  # defined the library would not even link on Darwin, and the generic POSIX
+  # path would build a CLOCK_MONOTONIC deadline for a CLOCK_REALTIME cond var,
+  # so every timed wait would return ETIMEDOUT immediately (the pool then
+  # degenerates into a busy polling loop).
+  foreach(DARWIN_UNSUPPORTED HAS_PTHREAD_CONDATTR_SETCLOCK HAS_SEM_TIMEDWAIT)
+    if(${DARWIN_UNSUPPORTED})
+      message(WARNING
+        "Darwin does not provide ${DARWIN_UNSUPPORTED}, forcing it off "
+        "(a stale CMakeCache.txt from another platform?)")
+      unset(${DARWIN_UNSUPPORTED} CACHE)
+      set(${DARWIN_UNSUPPORTED} FALSE)
+    endif()
+  endforeach()
+endif()
+
+# Write the probe results into os/ospx_config.h, exactly like ./configure does it
+# for the Makefile build: the template only carries the guard and the
+# "#cmakedefine" list, the values come from the probes above (the Darwin policy a
+# few lines up already forced the two unsupported switches off).
+set(STPOOL_FEATURES_ON "")
+foreach(FEATURE
+    HAS_STDINT_H
+    HAS_PTHREAD_RWLOCK
+    HAS_CLOCK_GETTIME
+    HAS_CLOCK_MONOTONIC
+    HAS_PTHREAD_CONDATTR_SETCLOCK
+    HAS_PTHREAD_ATTR_GETINHERITSCHED
+    HAS_SEM_TIMEDWAIT
+    HAS_PRCTL
+    )
+  if(${FEATURE})
+    list(APPEND STPOOL_FEATURES_ON ${FEATURE})
+  endif()
+endforeach()
+message(STATUS "libstpool features: ${STPOOL_FEATURES_ON}")
 
 configure_file(
     ${DIR_ROOT}/.help/.ospx_config.h.cmake
     ${DIR_OS}/ospx_config.h
         NEWLINE_STYLE UNIX)
+message(STATUS "libstpool config header: ${DIR_OS}/ospx_config.h")
+
+# ---------------------------------------------------------------------------
+# Optional diagnostics, only honoured by debug builds of the pool
+# ---------------------------------------------------------------------------
+option(LIBSTPOOL_TRACE_THREAD    "Trace the per thread scheduler/GC state (debug builds)" OFF)
+option(LIBSTPOOL_ERR_THREAD_SAFE "Protect the OSPX last-error storage with a rwlock"      OFF)
+
+set(STPOOL_CONFIG_DEFS "")
+if(LIBSTPOOL_TRACE_THREAD)
+  list(APPEND STPOOL_CONFIG_DEFS CONFIG_TRACE_THREAD_STATUS CONFIG_TRACE_THREAD_TIMEO)
+endif()
+if(LIBSTPOOL_ERR_THREAD_SAFE)
+  # NOTE: the sources spell the two switches differently (OPSX/OSPX) and both
+  # are needed: one declares the lock member, the other one uses it.
+  list(APPEND STPOOL_CONFIG_DEFS CONFIG_OPSX_ERR_THREAD_SAFE CONFIG_OSPX_ERR_THREAD_SAFE)
+endif()
 
 # Targets
 #include(CheckFunctionExists)
@@ -204,6 +312,11 @@ set(stpool_inc
   ${DIR_OS}/ospx_type.h
   )
 add_library(libstpool ${stpool_inc} ${stpool_src} )
+# HAS_* come from the generated os/ospx_config.h, only the optional diagnostics
+# above are passed on the command line.
+if(STPOOL_CONFIG_DEFS)
+  target_compile_definitions(libstpool PRIVATE ${STPOOL_CONFIG_DEFS})
+endif()
 list(APPEND LIB_COM libstpool)
 #add_library(libstpool ALIAS stpool)
 
@@ -219,7 +332,11 @@ ELSE()
   list(APPEND demo_src "${DIR_ROOT}/examples/demo-sche.c")
   list(APPEND demo_src "${DIR_ROOT}/examples/demo-group.c")
   list(APPEND demo_src "${DIR_ROOT}/examples/demo-overload.c")
-  list(APPEND LIB_COM pthread m rt)
+  list(APPEND LIB_COM pthread m)
+  if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    # clock_gettime()/sem_timedwait() live in librt before glibc 2.17
+    list(APPEND LIB_COM rt)
+  endif()
   add_executable(demo ${stpool_install_inc} "${DIR_ROOT}/examples/demo.c" )
   target_link_libraries(demo PRIVATE ${LIB_COM} )
   add_executable(demo-pri ${stpool_install_inc} "${DIR_ROOT}/examples/demo-pri.c" )
