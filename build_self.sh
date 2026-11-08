@@ -3,16 +3,16 @@
 CPATH=$(cd `dirname $0`; pwd)
 echo "PATH:$CPATH"
 
-ARCH=$1
-B_MD=$2
-B_TYPE=$3
-DIR_INSTALL=$4
+ARCH=${1:-64}
+B_MD=${2:-0}
+B_TYPE=${3:-Release}
+DIR_INSTALL=${4:-${CPATH}out}
 echo "args:'$*'"
 
-echo  --env--OPENSSL_ROOT:${OPENSSL_ROOT_DIR}
-echo  --env--ZLIB_ROOT:${ZLIB_ROOT}
-echo  --env--ZLIB_STATIC:${ZLIB_USE_STATIC_LIBS}
-echo  --env--ZSTD_ROOT:${ZSTD_ROOT}
+#echo  --env--OPENSSL_ROOT:${OPENSSL_ROOT_DIR}
+#echo  --env--ZLIB_ROOT:${ZLIB_ROOT}
+#echo  --env--ZLIB_STATIC:${ZLIB_USE_STATIC_LIBS}
+#echo  --env--ZSTD_ROOT:${ZSTD_ROOT}
 
 TOOLS_DIR=../../tools
 
